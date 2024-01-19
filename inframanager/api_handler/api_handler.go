@@ -42,7 +42,6 @@ import (
 )
 
 var hostInterface store.Iface
-var config *conf.Configuration
 
 // To identify different tcp packets based on tcp flag
 // ACK RST SYN FIN
@@ -71,9 +70,6 @@ const (
 	udp
 )
 
-func PutConf(c *conf.Configuration) {
-	config = c
-}
 func SetHostInterface() {
 	hostInterface = store.GetHostInterface()
 }
@@ -87,6 +83,7 @@ type RuleGroupIDX struct {
 type ApiServer struct {
 	listener   net.Listener
 	grpc       *grpc.Server
+	config     *conf.Configuration
 	log        *log.Entry
 	p4RtC      *client.Client
 	p4RtCConn  *grpc.ClientConn
@@ -97,6 +94,9 @@ type ApiServer struct {
 var api *ApiServer
 var once sync.Once
 var mutex = &sync.Mutex{}
+var replay bool
+var replayMutex sync.Mutex
+var Infrap4d = utils.NewServerStatus()
 
 func NewApiServer() *ApiServer {
 	once.Do(func() {
@@ -106,15 +106,15 @@ func NewApiServer() *ApiServer {
 }
 
 func GetLogLevel() string {
-	return config.LogLevel
+	return api.config.LogLevel
 }
 
-func OpenP4RtC(ctx context.Context, high uint64, low uint64, stopCh <-chan struct{}) error {
+func OpenP4RtC(ctx context.Context, high uint64, low uint64, stopCh <-chan struct{}, config conf.Configuration) error {
 	var err error
 
-	log.Infof("Connecting to P4Runtime Server at %s", config.Infrap4dGrpcServer.Addr)
-
 	server := NewApiServer()
+
+	log.Infof("Connecting to P4Runtime Server at %s", config.Infrap4dGrpcServer.Addr)
 
 	server.p4RtCConn, err = utils.GrpcDial(config.Infrap4dGrpcServer.Addr,
 		utils.GetConnType(config.Infrap4dGrpcServer.Conn), utils.Infrap4dGrpcServer)
@@ -130,6 +130,9 @@ func OpenP4RtC(ctx context.Context, high uint64, low uint64, stopCh <-chan struc
 		return err
 	}
 	log.Infof("P4Runtime server version is %s", resp.P4RuntimeApiVersion)
+
+	//// Set infrap4d to running state
+	//Infrap4d.SetRunning()
 
 	low = utils.MakeTimestampMilli()
 
@@ -176,7 +179,7 @@ func CloseP4RtCCon() {
 	}
 }
 
-func OpenGNMICCon() error {
+func OpenGNMICCon(config conf.Configuration) error {
 	var err error
 
 	server := NewApiServer()
@@ -201,8 +204,10 @@ func CloseGNMIConn() {
 
 func getPortID(ifName string, macAddr net.HardwareAddr) (portID uint32, err error) {
 
+	server := NewApiServer()
+
 	//TODO: Test for SRIOV
-	switch config.InterfaceType {
+	switch server.config.InterfaceType {
 	case types.SriovPodInterface, types.CDQInterface:
 		portID = (uint32(macAddr[1]) + 16)
 		return
@@ -240,7 +245,6 @@ func getPortID(ifName string, macAddr net.HardwareAddr) (portID uint32, err erro
 			Encoding: pb.Encoding_PROTO,
 		}
 
-		server := NewApiServer()
 		if resp, err = server.gNMIClient.Get(context.Background(),
 			req); err != nil {
 			return
@@ -267,10 +271,10 @@ func SetFwdPipe(ctx context.Context, binPath string,
 	return server.p4RtC.SetFwdPipe(ctx, binPath, p4InfoPath, cookie)
 }
 
-func CreateServer(log *log.Entry) *ApiServer {
+func CreateServer(conf *conf.Configuration, log *log.Entry) *ApiServer {
 	logger := log.WithField("func", "CreateAndStartServer")
 	logger.Infof("Starting infra-manager gRPC server, auth: %s",
-		config.InfraManager.Conn)
+		conf.InfraManager.Conn)
 
 	managerAddr := fmt.Sprintf("%s:%s", types.InfraManagerAddr, types.InfraManagerPort)
 	listen, err := net.Listen(types.ServerNetProto, managerAddr)
@@ -281,7 +285,7 @@ func CreateServer(log *log.Entry) *ApiServer {
 	server := NewApiServer()
 	server.grpc, err = utils.NewGrpcServer(utils.ServerParams{
 		KeepAlive: true,
-		ConnType:  utils.GetConnType(config.InfraManager.Conn),
+		ConnType:  utils.GetConnType(conf.InfraManager.Conn),
 		ConClient: utils.InfraAgent,
 	})
 
@@ -291,6 +295,7 @@ func CreateServer(log *log.Entry) *ApiServer {
 
 	server.listener = listen
 	server.log = log
+	server.config = conf
 
 	proto.RegisterInfraAgentServer(server.grpc, server)
 	healthgrpc.RegisterHealthServer(server.grpc, server)
@@ -318,6 +323,17 @@ func InsertDefaultRule() {
 
 	server := NewApiServer()
 
+	if !ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			log.Errorf("Infrap4d is not running while inserting the default rule.")
+			return
+		}
+		log.Infof("Infrap4d is running now")
+	}
+
 	IP, netIp, err := net.ParseCIDR(types.DefaultRoute)
 	if err != nil {
 		log.Errorf("Failed to get IP from the default route cidr %s", types.DefaultRoute)
@@ -332,13 +348,13 @@ func InsertDefaultRule() {
 		return
 	}
 
-	macAddress, err := net.ParseMAC(config.InfraManager.ArpMac)
+	macAddress, err := net.ParseMAC(server.config.InfraManager.ArpMac)
 	if err != nil {
-		log.Errorf("Invalid MAC Address: %s, err: %v", config.InfraManager.ArpMac, err)
+		log.Errorf("Invalid MAC Address: %s, err: %v", server.config.InfraManager.ArpMac, err)
 		return
 	}
 
-	if config.InterfaceType == types.TapInterface {
+	if server.config.InterfaceType == types.TapInterface {
 		portID = types.ArpProxyDefaultPort
 	} else {
 		if portID, err = getPortID("dummy", macAddress); err != nil {
@@ -348,17 +364,17 @@ func InsertDefaultRule() {
 		}
 	}
 
-	log.Infof("Inserting default gateway rule for arp-proxy route, arp mac: %s", config.InfraManager.ArpMac)
+	log.Infof("Inserting default gateway rule for arp-proxy route, arp mac: %s", server.config.InfraManager.ArpMac)
 
 	if err := p4.ArptToPortTable(context.Background(), server.p4RtC, ip,
 		portID, true); err != nil {
-		log.Errorf("Failed to insert the default rule for arp-proxy")
+		log.Errorf("Failed to insert the default rule for arp-proxy, err: %v", err)
 	}
 	//service default rule
 	ep := store.EndPoint{
 		PodIpAddress:  ip,
 		InterfaceID:   portID,
-		PodMacAddress: config.InfraManager.ArpMac,
+		PodMacAddress: server.config.InfraManager.ArpMac,
 	}
 
 	entry := ep.GetFromStore()
@@ -371,9 +387,9 @@ func InsertDefaultRule() {
 		}
 	}
 
-	log.Infof("Inserting default gateway rule for service: ServiceFlowPacketOptions")
 	action := p4.Insert
-	if config.InterfaceType != types.TapInterface {
+	if server.config.InterfaceType != types.TapInterface {
+		log.Infof("Inserting default gateway rule for service: ServiceFlowPacketOptions")
 		err = p4.ServiceFlowPacketOptions(context.Background(), server.p4RtC, flags, action)
 		if err != nil {
 			log.Errorf("Failed to insert ServiceFlowPacketOptions")
@@ -423,7 +439,20 @@ func (s *ApiServer) Stop() {
 func insertRule(log *log.Entry, ctx context.Context, p4RtC *client.Client, macAddr string, ipAddr string, portID uint32, ifaceType p4.InterfaceType) (bool, error) {
 	var err error
 
+	server := NewApiServer()
+
 	logger := log.WithField("func", "insertRule")
+
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			logger.Errorf("Infrap4d is not running")
+			return false, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
 
 	ep := store.EndPoint{
 		PodIpAddress:  ipAddr,
@@ -468,6 +497,82 @@ func insertRule(log *log.Entry, ctx context.Context, p4RtC *client.Client, macAd
 	return true, err
 }
 
+func ReplaySet() bool {
+	return replay
+}
+
+func SetReplay() {
+	replayMutex.Lock()
+	replay = true
+	replayMutex.Unlock()
+}
+func ClearReplay() {
+	replayMutex.Lock()
+	replay = false
+	replayMutex.Unlock()
+}
+
+/*
+Read from the store and reprogram all rules to the pipeline.
+This is used when the infrap4d is restarted.
+*/
+
+func ReplayRules() {
+	ctx := context.Background()
+
+	server := NewApiServer()
+	defer ClearReplay()
+
+	defaultRouteIP := strings.Split(types.DefaultRoute, "/")[0]
+	hostIfaceIP := strings.Split(types.HostInterfaceAddr, "/")[0]
+	nodeIP := server.config.NodeIP
+
+	// Program cni add rules for all eps
+	eps := store.GetAllEndpoints()
+	for _, ep := range eps {
+		switch ep.PodIpAddress {
+		// Default rule
+		case defaultRouteIP:
+			var portID uint32
+			if server.config.InterfaceType == types.TapInterface {
+				portID = types.ArpProxyDefaultPort
+			} else {
+				macAddr, err := net.ParseMAC(ep.PodMacAddress)
+				if err != nil {
+					log.Fatalf("Invalid MAC Address: %s, err: %v", server.config.InfraManager.ArpMac, err)
+				}
+				if portID, err = getPortID("dummy", macAddr); err != nil {
+					log.Fatalf("Failed to get port id for %s, err: %v",
+						"dummy", err)
+				}
+			}
+			p4.ArptToPortTable(context.Background(),
+				server.p4RtC, ep.PodIpAddress, portID, true)
+
+		// SetupHostInterface
+		case hostIfaceIP, nodeIP:
+			p4.InsertCniRules(ctx, server.p4RtC, ep, p4.HOST)
+		// CNI Add
+		default:
+			p4.InsertCniRules(ctx, server.p4RtC, ep, p4.ENDPOINT)
+		}
+	}
+
+	// Program service rules
+	svcs := store.GetAllServices()
+	for _, svc := range svcs {
+		var podPortIDs []uint16
+		var podIpAddrs []string
+
+		for _, ep := range svc.ServiceEndPoint {
+			podIpAddrs = append(podIpAddrs, ep.IpAddress)
+			podPortIDs = append(podPortIDs, ep.Port)
+		}
+		p4.InsertServiceRules(ctx, server.p4RtC, podIpAddrs,
+			podPortIDs, svc, false, true)
+	}
+}
+
 func (s *ApiServer) CreateNetwork(ctx context.Context, in *proto.CreateNetworkRequest) (*proto.AddReply, error) {
 	var err error
 
@@ -500,6 +605,18 @@ func (s *ApiServer) CreateNetwork(ctx context.Context, in *proto.CreateNetworkRe
 	logger.Infof("Incoming Add request %s", in.String())
 
 	server := NewApiServer()
+
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// TODO: Wait till context timeout instead of infrap4d timeout
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
 
 	ipAddr := strings.Split(in.AddRequest.ContainerIps[0].Address, "/")[0]
 
@@ -547,6 +664,7 @@ func (s *ApiServer) DeleteNetwork(ctx context.Context, in *proto.DeleteNetworkRe
 	out := &proto.DelReply{
 		Successful: true,
 	}
+
 	if in == nil || reflect.DeepEqual(*in, proto.DeleteNetworkRequest{}) {
 		out.Successful = false
 		logger.Errorf("Empty CNI Del request")
@@ -556,6 +674,17 @@ func (s *ApiServer) DeleteNetwork(ctx context.Context, in *proto.DeleteNetworkRe
 	logger.Infof("Incoming Del request %s", in.String())
 
 	server := NewApiServer()
+
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
 
 	ipAddr := strings.Split(in.Ipv4Addr, "/")[0]
 	macAddr := in.MacAddr
@@ -639,6 +768,19 @@ func (s *ApiServer) NatTranslationAdd(ctx context.Context, in *proto.NatTranslat
 		return out, err
 	}
 
+	server := NewApiServer()
+
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
+
 	// Use Host Interface MAC address for service
 	serviceMacAddr := hostInterface.Mac
 	serviceIpAddr := in.Endpoint.Ipv4Addr
@@ -687,7 +829,6 @@ func (s *ApiServer) NatTranslationAdd(ctx context.Context, in *proto.NatTranslat
 		service.ServiceEndPoint = make(map[string]store.ServiceEndPoint)
 	}
 
-	server := NewApiServer()
 	newEps := 0
 
 	for _, e := range in.Backends {
@@ -709,7 +850,7 @@ func (s *ApiServer) NatTranslationAdd(ctx context.Context, in *proto.NatTranslat
 
 	//Update: We need to handle in p4 layer.
 	err, service = p4.InsertServiceRules(ctx, server.p4RtC, podIpAddrs,
-		podPortIDs, service, update)
+		podPortIDs, service, update, false)
 	if err != nil {
 		logger.Errorf("Failed to insert the service entry %s:%s:%d, backends: %v, into the pipeline",
 			serviceIpAddr, in.Proto, in.Endpoint.Port, podIpAddrs)
@@ -784,6 +925,17 @@ func (s *ApiServer) NatTranslationDelete(ctx context.Context, in *proto.NatTrans
 
 	server := NewApiServer()
 
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
+
 	if err := p4.DeleteServiceRules(ctx, server.p4RtC, service); err != nil {
 		logger.Errorf("Failed to delete the service entry %s:%s:%d from the pipeline",
 			in.Endpoint.Ipv4Addr, in.Proto, in.Endpoint.Port)
@@ -824,15 +976,26 @@ func (s *ApiServer) ActivePolicyUpdate(ctx context.Context, in *proto.ActivePoli
 
 	logger.Infof("Incoming updatePolicy Request %+v", in)
 
+	server := NewApiServer()
+
 	/*
 		Currently supporting policies for dpdk target only
 	*/
 
-	if config.InterfaceType != "tap" {
+	if server.config.InterfaceType != "tap" {
 		return out, nil
 	}
 
-	server := NewApiServer()
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
 
 	ingress[tcp].RuleGroup.Protocol = p4.PROTO_TCP
 	egress[tcp].RuleGroup.Protocol = p4.PROTO_TCP
@@ -1026,6 +1189,16 @@ func (s *ApiServer) ActivePolicyRemove(ctx context.Context, in *proto.ActivePoli
 
 	defer recoverPanic(logger)
 
+	server := NewApiServer()
+
+	/*
+		Currently supporting policies for dpdk target only
+	*/
+
+	if server.config.InterfaceType != "tap" {
+		return out, nil
+	}
+
 	if in == nil || reflect.DeepEqual(*in, proto.ActivePolicyRemove{}) {
 		err := errors.New("Empty policy delete request")
 		logger.Errorf("Empty policy delete request.")
@@ -1035,15 +1208,16 @@ func (s *ApiServer) ActivePolicyRemove(ctx context.Context, in *proto.ActivePoli
 
 	logger.Infof("Incoming deletePolicy Request %+v", in)
 
-	/*
-		Currently supporting policies for dpdk target only
-	*/
-
-	if config.InterfaceType != "tap" {
-		return out, nil
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
 	}
-
-	server := NewApiServer()
 
 	policy := store.Policy{
 		Name: in.Id.Name,
@@ -1133,6 +1307,16 @@ func (s *ApiServer) UpdateLocalEndpoint(ctx context.Context, in *proto.WorkloadE
 		Successful: true,
 	}
 
+	server := NewApiServer()
+
+	/*
+		Currently supporting policies for dpdk target only
+	*/
+
+	if server.config.InterfaceType != "tap" {
+		return out, nil
+	}
+
 	if in == nil || reflect.DeepEqual(*in, proto.WorkloadEndpointUpdate{}) {
 		err := errors.New("Empty update local endpoint request")
 		logger.Errorf("Empty update local endpoint request.")
@@ -1142,14 +1326,6 @@ func (s *ApiServer) UpdateLocalEndpoint(ctx context.Context, in *proto.WorkloadE
 
 	logger.Infof("Incoming UpdateLocalEndpoint Request %+v", in)
 
-	/*
-		Currently supporting policies for dpdk target only
-	*/
-
-	if config.InterfaceType != "tap" {
-		return out, nil
-	}
-
 	if len(in.Endpoint.Ipv4Nets) == 0 {
 		err := errors.New("No IP address assigned for the endpoint")
 		logger.Errorf("No IP addresses assigned for the endpoint")
@@ -1157,7 +1333,16 @@ func (s *ApiServer) UpdateLocalEndpoint(ctx context.Context, in *proto.WorkloadE
 		return out, err
 	}
 
-	server := NewApiServer()
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
 
 	ipAddr := strings.Split(in.Endpoint.Ipv4Nets[0], "/")[0]
 	if net.ParseIP(ipAddr) == nil {
@@ -1212,6 +1397,16 @@ func (s *ApiServer) RemoveLocalEndpoint(ctx context.Context, in *proto.WorkloadE
 		Successful: true,
 	}
 
+	server := NewApiServer()
+
+	/*
+		Currently supporting policies for dpdk target only
+	*/
+
+	if server.config.InterfaceType != "tap" {
+		return out, nil
+	}
+
 	if in == nil || reflect.DeepEqual(*in, proto.WorkloadEndpointRemove{}) {
 		err := errors.New("Empty remove local endpoint request")
 		logger.Errorf("Empty remove local endpoint request.")
@@ -1221,15 +1416,16 @@ func (s *ApiServer) RemoveLocalEndpoint(ctx context.Context, in *proto.WorkloadE
 
 	logger.Infof("Incoming RemoveLocalEndpoint Request %+v", in)
 
-	/*
-		Currently supporting policies for dpdk target only
-	*/
-
-	if config.InterfaceType != "tap" {
-		return out, nil
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
 	}
-
-	server := NewApiServer()
 
 	workerEp := store.PolicyWorkerEndPoint{
 		WorkerEp: in.Id.WorkloadId,
@@ -1373,11 +1569,24 @@ func (s *ApiServer) SetupHostInterface(ctx context.Context, in *proto.SetupHostI
 	}
 
 	logger.Infof("Incoming SetupHostInterface request %s", in.String())
+
 	server := NewApiServer()
+
+	if ReplaySet() || !Infrap4d.Running() {
+		log.Infof("Infrap4d is not running, waiting to restart")
+		// Wait till timeout for the infrap4d to restart
+		ret := Infrap4d.WaitToRestart(server.config.Infrap4dTimeout)
+		if ret == false {
+			out.Successful = false
+			return out, errors.New("Infrap4d is not running")
+		}
+		log.Infof("Infrap4d is running now")
+	}
+
 	updateHostIP := false
 	updateNodeIP := false
 
-	if len(config.NodeIP) == 0 {
+	if len(s.config.NodeIP) == 0 {
 		logger.Errorf("No node ip address configured")
 		err = fmt.Errorf("No node ip address configured")
 		out.Successful = false
@@ -1458,7 +1667,7 @@ func (s *ApiServer) SetupHostInterface(ctx context.Context, in *proto.SetupHostI
 		}
 
 		ep = store.EndPoint{
-			PodIpAddress: config.NodeIP,
+			PodIpAddress: s.config.NodeIP,
 		}
 
 		entry = ep.GetFromStore()
@@ -1485,19 +1694,20 @@ func (s *ApiServer) SetupHostInterface(ctx context.Context, in *proto.SetupHostI
 
 	if updateNodeIP {
 		status, err := insertRule(s.log, ctx, server.p4RtC, macAddr,
-			config.NodeIP, portID, p4.HOST)
+			s.config.NodeIP, portID, p4.HOST)
 		if err != nil {
 			logger.Errorf("Failed to insert rule to the pipeline p: %s mac: %s port id: %d err: %v",
-				config.NodeIP, macAddr, portID, err)
+				s.config.NodeIP, macAddr, portID, err)
 			out.Successful = status
 			return out, err
 		}
 	}
+
 	hostInterface.Ip = ipAddr
 	hostInterface.Mac = macAddr
 
 	/* Add to store */
-	store.SetHostInterface(ipAddr, macAddr)
+	store.SetHostInterface(in.IfName, ipAddr, macAddr)
 
 	return out, nil
 }
